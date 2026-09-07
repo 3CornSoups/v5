@@ -327,3 +327,587 @@ def _enhance_omni_lora(
     if mech_router_mode not in MECHANISM_ROUTER_MODES:
         raise ValueError(f"mechanism_router 须为 {' / '.join(MECHANISM_ROUTER_MODES)}")
 
+    style_sel = select_style_skills(
+        intent,
+        inventory=None,
+        forced=skills,
+        router="keyword" if router_mode in {"hybrid", "llm"} else router_mode,
+        classify=None,
+    )
+    mech_sel = select_mechanisms(
+        intent,
+        inventory=None,
+        forced=mechanisms,
+        router="keyword" if mech_router_mode in {"hybrid", "llm"} else mech_router_mode,
+        classify=None,
+    )
+    steps.append(
+        {
+            "stage": "skill_route",
+            "source": f"omni_lora+{style_sel.source}",
+            "skills": style_sel.ids,
+            "scores": style_sel.scores,
+            "threshold": style_sel.threshold,
+            "note": "omni_lora 快路径下 hybrid 降为 keyword，避免额外 LLM 往返",
+        }
+    )
+    if mech_sel.ids:
+        steps.append(
+            {
+                "stage": "mechanism_route",
+                "text": f"source=omni_lora+{mech_sel.source}; mechanisms={', '.join(mech_sel.ids)}",
+            }
+        )
+
+    omni = omni_lora_rewrite(
+        mode=mode,
+        intent=intent,
+        duration=duration,
+        first_frame=first_frame,
+        last_frame=last_frame,
+        reference_images=images or None,
+        reference_videos=videos or None,
+        reference_audios=audios or None,
+        resolution=resolution,
+    )
+    prompt = (omni.get("enhanced_prompt") or "").strip()
+    if not prompt:
+        raise RuntimeError("Omni LoRA 返回空 enhanced_prompt")
+    prompt = ensure_alignment_prefix(mode, strip_canvas(prompt), duration)
+    steps.append(
+        {
+            "stage": "omni_lora_rewrite",
+            "task": omni.get("task"),
+            "schema_ok": omni.get("schema_ok"),
+            "server_latency_sec": omni.get("latency_sec"),
+            "client_latency_sec": omni.get("client_latency_sec"),
+            "text": prompt,
+        }
+    )
+
+    total_sec = round(time.perf_counter() - t0, 3)
+    record: dict[str, Any] = {
+        "mode": mode,
+        "backend": "omni_lora",
+        "intent": intent,
+        "duration": duration,
+        "first_frame": first_frame,
+        "last_frame": last_frame,
+        "reference_images": images if mode == "r2va" else [],
+        "i2va_first_frame": first_frame if mode == "i2va" else None,
+        "reference_videos": videos,
+        "reference_audios": audios,
+        "inventory": None,
+        "contract": None,
+        "expanded": None,
+        "elaborated": None,
+        "style_skills": style_sel.ids,
+        "style_skill_source": f"omni_lora+{style_sel.source}",
+        "style_skill_scores": style_sel.scores,
+        "style_skill_threshold": style_sel.threshold,
+        "mechanisms": mech_sel.ids,
+        "mechanism_source": f"omni_lora+{mech_sel.source}",
+        "prompt_official": prompt,
+        "prompt": prompt,
+        "verify": {
+            "status": "skipped",
+            "fixed": False,
+            "issues": [],
+            "schema_ok": bool(omni.get("schema_ok")),
+        },
+        "omni_lora": {
+            "schema_ok": omni.get("schema_ok"),
+            "latency_sec": omni.get("latency_sec"),
+            "client_latency_sec": omni.get("client_latency_sec"),
+            "endpoint": omni.get("endpoint"),
+            "effective_duration": omni.get("effective_duration"),
+            "references": omni.get("references"),
+        },
+        "timing": {"total_sec": total_sec, "http_calls": 1},
+        "steps": steps,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if out_dir is not None:
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "prompt.txt").write_text(prompt + "\n", encoding="utf-8")
+        (out_dir / "run.json").write_text(
+            json.dumps(record, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        record["out_dir"] = str(out_dir)
+    return record
+
+
+def enhance(
+    mode: str,
+    intent: str,
+    *,
+    first_frame: str | None = None,
+    last_frame: str | None = None,
+    reference_images: list[str] | None = None,
+    reference_videos: list[str] | None = None,
+    reference_audios: list[str] | None = None,
+    duration: int | None = None,
+    out_dir: Path | None = None,
+    skills: list[str] | None = None,
+    skill_router: str = "hybrid",
+    mechanisms: list[str] | None = None,
+    mechanism_router: str = "hybrid",
+    enable_verify: bool = True,
+    verify_intent_llm: bool | None = None,
+    backend: str | None = None,
+    resolution: str | None = None,
+) -> dict[str, Any]:
+    """
+    跑完感知（若需要）→ 风格/机制路由 → 扩写 → 补细节 → 注入官方指南后格式化。
+
+    skills: 强制加载的风格 skill id。
+    skill_router: off / keyword / hybrid / llm。
+    hybrid / llm：前置模型为各 skill 打 0~1 分，仅加载 >= match_threshold（默认 0.8）；
+    keyword：仍可只用触发词；off：只用强制 id。
+    mechanisms: 强制加载的 T8 Creative DNA 机制 id。
+    mechanism_router: 机制路由模式，默认同 skill_router（机制侧仍为关键词优先 hybrid）。
+    backend: gemini（默认多轮）| omni_lora（本地 Omni+LoRA 单次改写）。
+
+    Returns:
+        含 prompt、各步原文、mode
+    """
+    mode = mode.lower().strip()
+    if mode not in ALL_MODES:
+        raise ValueError(f"mode 须为 {' / '.join(ALL_MODES)}")
+    intent = (intent or "").strip()
+    if not intent:
+        raise ValueError("短意图为空")
+
+    images = list(reference_images or [])
+    videos = list(reference_videos or [])
+    audios = list(reference_audios or [])
+    if mode == "i2va" and not first_frame:
+        raise ValueError("i2va 需要 --first-frame")
+    if mode == "fl2va" and (not first_frame or not last_frame):
+        raise ValueError("fl2va 需要同时提供 --first-frame 与 --last-frame")
+    if mode == "l2va" and not last_frame:
+        raise ValueError("l2va 需要 --last-frame")
+    if mode == "r2va":
+        if not images and not videos:
+            raise ValueError("r2va 须至少 1 张参考图或 1 段参考视频")
+        if len(images) > 9:
+            raise ValueError("r2va 参考图数量 ≤ 9")
+        if len(videos) > 3:
+            raise ValueError("r2va 参考视频数量 ≤ 3")
+        if len(audios) > 3:
+            raise ValueError("r2va 参考音频数量 ≤ 3")
+
+    pe_backend = _resolve_pe_backend(backend)
+    steps: list[dict[str, Any]] = []
+    dur = duration if duration is not None else infer_duration(intent)
+    inventory: str | None = None
+
+    if pe_backend == "omni_lora":
+        return _enhance_omni_lora(
+            mode,
+            intent,
+            first_frame=first_frame,
+            last_frame=last_frame,
+            images=images,
+            videos=videos,
+            audios=audios,
+            duration=dur,
+            out_dir=out_dir,
+            skills=skills,
+            skill_router=skill_router,
+            mechanisms=mechanisms,
+            mechanism_router=mechanism_router,
+            resolution=resolution,
+        )
+
+    import time as _time
+
+    _t0 = _time.perf_counter()
+
+    if mode in KEYFRAME_MODES:
+        inventory, rescan = _perceive_keyframes(
+            mode,
+            first_frame=first_frame,
+            last_frame=last_frame,
+            duration=dur,
+        )
+        steps.append({"stage": "perceive_image", "text": inventory})
+        if rescan:
+            steps.append({"stage": rescan, "text": inventory})
+    elif mode == "r2va":
+        labels = []
+        for i, p in enumerate(images, 1):
+            labels.append(f"<Picture {i}> = {p}")
+        for i, p in enumerate(videos, 1):
+            labels.append(f"<Video {i}> = {p}")
+        for i, p in enumerate(audios, 1):
+            labels.append(f"<Audio {i}> = {p}")
+        system = load_prompt("perceive_refs")
+        text = _append_grid_scan(
+            "Inventory attached assets in this order:\n" + "\n".join(labels)
+        )
+        inventory = chat(
+            system,
+            user_parts(
+                text,
+                images=images or None,
+                videos=videos or None,
+                audios=audios or None,
+            ),
+            stage="perceive",
+        )
+        steps.append({"stage": "perceive_refs", "text": inventory})
+        rescanned, rescan = _rescan_if_grid_incomplete(
+            system,
+            inventory,
+            text=text,
+            images=images or None,
+            videos=videos or None,
+            audios=audios or None,
+        )
+        if rescan:
+            inventory = rescanned
+            steps.append({"stage": rescan, "text": inventory})
+
+    # Intent Contract：感知后、路由前；以 01_parse_intent (LLM) 为唯一主真理源，只抽取不推断。
+    contract = parse_intent(intent, mode=mode, inventory=inventory, chat=chat, use_llm=True)
+    steps.append({"stage": "contract", "text": contract.format_for_prompt()})
+    # 时长只有一个真值：显式 API 参数优先，并同步回 Intent Contract。
+    # 否则 contract 中默认的 5 秒会继续进入 expand / format，覆盖调用方传入的时长。
+    if duration is not None:
+        contract.duration_sec = float(dur)
+    elif contract.duration_sec:
+        dur = int(contract.duration_sec)
+
+    router_mode = (skill_router or "hybrid").strip().lower()
+    if router_mode not in ROUTER_MODES:
+        raise ValueError(f"skill_router 须为 {' / '.join(ROUTER_MODES)}")
+
+    mech_router_mode = (mechanism_router or "hybrid").strip().lower()
+    if mech_router_mode not in MECHANISM_ROUTER_MODES:
+        raise ValueError(f"mechanism_router 须为 {' / '.join(MECHANISM_ROUTER_MODES)}")
+
+    # 并发执行风格路由与机制路由（减少串行 LLM 往返延迟）
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as router_pool:
+        f_style = router_pool.submit(
+            select_style_skills,
+            intent,
+            inventory=inventory,
+            forced=skills,
+            router=router_mode,
+            classify=chat if router_mode in {"hybrid", "llm"} else None,
+            explicit_style=contract.explicit_style,
+            explicit_negatives=list(contract.explicit_negatives or []),
+        )
+        f_mech = router_pool.submit(
+            select_mechanisms,
+            intent,
+            inventory=inventory,
+            forced=mechanisms,
+            router=mech_router_mode,
+            classify=chat if mech_router_mode in {"hybrid", "llm"} else None,
+        )
+        style_sel = f_style.result()
+        mech_sel = f_mech.result()
+
+    style_block = style_block_for_user(style_sel)
+    extra_guides = style_sel.overlay_pairs()
+    if style_sel.ids or style_sel.scores:
+        steps.append(
+            {
+                "stage": "skill_route",
+                "source": style_sel.source,
+                "skills": style_sel.ids,
+                "scores": style_sel.scores,
+                "threshold": style_sel.threshold,
+            }
+        )
+
+    mechanism_block = mechanism_block_for_user(mech_sel)
+    writing_block = writing_blocks_for_user(style_block, mechanism_block)
+    if mech_sel.ids:
+        steps.append(
+            {
+                "stage": "mechanism_route",
+                "text": f"source={mech_sel.source}; mechanisms={', '.join(mech_sel.ids)}",
+            }
+        )
+
+    contract_block = contract.format_for_prompt()
+    complexity_block = format_complexity_budget_block(contract)
+
+    # 先扩展意图骨架，再用独立 elaborate 阶段补足可执行的物理、镜头与声画细节。
+    expand_sys = load_prompt("expand_intent")
+    expanded = chat(
+        expand_sys,
+        _expand_user(
+            intent,
+            inventory=inventory,
+            mode=mode,
+            writing_block=writing_block,
+            contract_block=contract_block,
+            complexity_block=complexity_block,
+            contract=contract,
+        ),
+        stage="expand",
+    )
+    steps.append({"stage": "expand", "text": expanded})
+    elaborated = chat(
+        load_prompt("elaborate"),
+        _elaborate_user(
+            expanded,
+            inventory,
+            intent,
+            contract_block=contract_block,
+            complexity_block=complexity_block,
+            contract=contract,
+        ),
+        stage="elaborate",
+    )
+    steps.append({"stage": "elaborate", "text": elaborated})
+
+    format_sys = compose_format_system(mode, load_prompt("format_h3"), extra_guides)
+    format_text = _format_user(
+        mode,
+        elaborated,
+        inventory=inventory,
+        duration=dur,
+        intent=intent,
+        contract_block=contract_block,
+        contract=contract,
+    )
+    format_user = format_text
+    raw_prompt = chat(format_sys, format_user, stage="format")
+    official_prompt = raw_prompt
+    prompt = ensure_alignment_prefix(mode, strip_canvas(raw_prompt), dur)
+    steps.append({"stage": "format", "text": prompt})
+
+    # 确定性规则硬修复与快速清洗（毫秒级开销，无额外网络往返）
+    if mode in KEYFRAME_MODES:
+        frame_images = [p for p in (first_frame, last_frame) if p]
+        verify_imgs, verify_vids, verify_auds = len(frame_images), 0, 0
+    else:
+        verify_imgs = len(images) if mode == "r2va" else 0
+        verify_vids = len(videos) if mode == "r2va" else 0
+        verify_auds = len(audios) if mode == "r2va" else 0
+
+    verify_result = verify_and_fix(
+        mode,
+        prompt,
+        duration=dur,
+        images=verify_imgs,
+        videos=verify_vids,
+        audios=verify_auds,
+        chat=chat if (enable_verify and verify_intent_llm) else None,
+        asset_fix_chat=chat if enable_verify else None,
+        intent=intent,
+        inventory=inventory,
+        check_intent_llm=False,
+        max_fix_rounds=1 if (enable_verify and verify_intent_llm) else 0,
+        contract=contract,
+        max_fidelity_fix_rounds=0,
+    )
+    prompt = verify_result["prompt"]
+    # 清洗最终 prompt：严禁带有 MODE= 前缀或 markdown 块
+    prompt = re.sub(r"^MODE=[a-z0-9_]+\s*\n+", "", prompt.strip(), flags=re.I).strip()
+    if prompt.startswith("```"):
+        prompt = prompt.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+
+    import time as _time
+
+    # pe_backend 分支进入本路径前未计时：用 steps 里请求次数近似 http_calls
+    http_calls = sum(
+        1
+        for s in steps
+        if s.get("stage")
+        in {
+            "perceive_image",
+            "perceive_refs",
+            "contract",
+            "skill_route",
+            "mechanism_route",
+            "expand",
+            "elaborate",
+            "format",
+        }
+        or str(s.get("stage", "")).startswith("rescan")
+    )
+
+    record: dict[str, Any] = {
+        "mode": mode,
+        "backend": "gemini",
+        "intent": intent,
+        "duration": dur,
+        "first_frame": first_frame,
+        "last_frame": last_frame,
+        "reference_images": images if mode == "r2va" else [],
+        "i2va_first_frame": first_frame if mode == "i2va" else None,
+        "reference_videos": videos,
+        "reference_audios": audios,
+        "inventory": inventory,
+        "contract": contract.to_dict(),
+        "expanded": expanded,
+        "elaborated": elaborated,
+        "style_skills": style_sel.ids,
+        "style_skill_source": style_sel.source,
+        "style_skill_scores": style_sel.scores,
+        "style_skill_threshold": style_sel.threshold,
+        "mechanisms": mech_sel.ids,
+        "mechanism_source": mech_sel.source,
+        "prompt_official": official_prompt,
+        "prompt": prompt,
+        "verify": verify_result,
+        "timing": {
+            "total_sec": round(_time.perf_counter() - _t0, 3),
+            "http_calls_estimate": http_calls,
+        },
+        "steps": steps,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    if out_dir is not None:
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
+        (out_dir / "prompt_official_raw.txt").write_text(
+            official_prompt.strip() + "\n",
+            encoding="utf-8",
+        )
+        (out_dir / "expanded.txt").write_text(expanded.strip() + "\n", encoding="utf-8")
+        (out_dir / "elaborated.txt").write_text(elaborated.strip() + "\n", encoding="utf-8")
+        if inventory:
+            (out_dir / "inventory.txt").write_text(inventory.strip() + "\n", encoding="utf-8")
+        (out_dir / "contract.json").write_text(
+            json.dumps(contract.to_dict(), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        slim = {k: v for k, v in record.items() if k != "steps"}
+        slim["steps"] = steps
+        (out_dir / "run.json").write_text(
+            json.dumps(slim, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        record["out_dir"] = str(out_dir)
+    return record
+
+
+def run_job(
+    mode: str,
+    intent: str,
+    *,
+    first_frame: str | None = None,
+    last_frame: str | None = None,
+    reference_images: list[str] | None = None,
+    reference_videos: list[str] | None = None,
+    reference_audios: list[str] | None = None,
+    duration: int | None = None,
+    ratio: str | None = None,
+    resolution: str | None = None,
+    out_dir: Path | None = None,
+    make_video: bool = True,
+    wait_video: bool = True,
+    compare_video: bool = False,
+    skills: list[str] | None = None,
+    skill_router: str = "hybrid",
+    mechanisms: list[str] | None = None,
+    mechanism_router: str = "hybrid",
+    enable_verify: bool = True,
+    verify_intent_llm: bool | None = None,
+    backend: str | None = None,
+) -> dict[str, Any]:
+    """增强 prompt，可选调用 H3 出片。画幅/分辨率只进视频 API。"""
+    h3 = h3_settings()
+    dur = duration if duration is not None else infer_duration(intent, h3["default_duration"])
+    if out_dir is None:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = ROOT / "runs" / f"{mode}_{stamp}"
+    rec = enhance(
+        mode,
+        intent,
+        first_frame=first_frame,
+        last_frame=last_frame,
+        reference_images=reference_images,
+        reference_videos=reference_videos,
+        reference_audios=reference_audios,
+        duration=dur,
+        out_dir=out_dir,
+        skills=skills,
+        skill_router=skill_router,
+        mechanisms=mechanisms,
+        mechanism_router=mechanism_router,
+        enable_verify=enable_verify,
+        verify_intent_llm=verify_intent_llm,
+        backend=backend,
+        resolution=ratio,
+    )
+    rec["ratio_api"] = ratio or (h3["default_ratio"] if mode == "t2va" else "adaptive")
+    rec["resolution_api"] = resolution or h3["default_resolution"]
+    rec["make_video"] = make_video
+    rec["compare_video"] = compare_video
+
+    prompt_official = rec.get("prompt_official") or ""
+    prompt_local = rec.get("prompt") or ""
+    video_official: dict[str, Any] | None = None
+    video_local: dict[str, Any] | None = None
+    if make_video:
+        video_local_path = Path(out_dir) / "out_local.mp4"
+        video_local_res = generate_video(
+            mode,
+            prompt_local,
+            duration=dur,
+            ratio=ratio,
+            resolution=resolution,
+            first_frame=first_frame,
+            last_frame=last_frame,
+            reference_images=reference_images,
+            reference_videos=reference_videos,
+            reference_audios=reference_audios,
+            output=video_local_path,
+            wait=wait_video,
+        )
+        video_local = {k: v for k, v in video_local_res.items() if k != "task"}
+        video_local["task_status"] = (video_local_res.get("task") or {}).get("status")
+        rec["video"] = video_local
+
+        if compare_video:
+            video_official_path = Path(out_dir) / "out_official.mp4"
+            video_official_res = generate_video(
+                mode,
+                prompt_official,
+                duration=dur,
+                ratio=ratio,
+                resolution=resolution,
+                first_frame=first_frame,
+                last_frame=last_frame,
+                reference_images=reference_images,
+                reference_videos=reference_videos,
+                reference_audios=reference_audios,
+                output=video_official_path,
+                wait=wait_video,
+            )
+            video_official = {k: v for k, v in video_official_res.items() if k != "task"}
+            video_official["task_status"] = (video_official_res.get("task") or {}).get("status")
+            rec["video_official"] = video_official
+
+        run_path = Path(out_dir) / "run.json"
+        if run_path.is_file():
+            dumped = json.loads(run_path.read_text(encoding="utf-8"))
+            dumped["video"] = rec.get("video")
+            dumped["video_official"] = rec.get("video_official")
+            dumped["ratio_api"] = rec["ratio_api"]
+            dumped["resolution_api"] = rec["resolution_api"]
+            run_path.write_text(json.dumps(dumped, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    # 无论是否出片，都写出提示词对比报告（可选视频对比会包含对应视频结果）。
+    write_report(
+        out_dir,
+        record=rec,
+        prompt_official=prompt_official,
+        prompt_local=prompt_local,
+        video_official=video_official,
+        video_local=video_local,
+    )
+    return rec
