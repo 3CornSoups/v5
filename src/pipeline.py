@@ -499,4 +499,181 @@ def enhance(
         if len(audios) > 3:
             raise ValueError("r2va 参考音频数量 ≤ 3")
 
-    pe_backend = _resolve_pe_backend(b
+    pe_backend = _resolve_pe_backend(backend)
+    steps: list[dict[str, Any]] = []
+    dur = duration if duration is not None else infer_duration(intent)
+    inventory: str | None = None
+
+    if pe_backend == "omni_lora":
+        return _enhance_omni_lora(
+            mode,
+            intent,
+            first_frame=first_frame,
+            last_frame=last_frame,
+            images=images,
+            videos=videos,
+            audios=audios,
+            duration=dur,
+            out_dir=out_dir,
+            skills=skills,
+            skill_router=skill_router,
+            mechanisms=mechanisms,
+            mechanism_router=mechanism_router,
+            resolution=resolution,
+        )
+
+    import time as _time
+
+    _t0 = _time.perf_counter()
+
+    if mode in KEYFRAME_MODES:
+        inventory, rescan = _perceive_keyframes(
+            mode,
+            first_frame=first_frame,
+            last_frame=last_frame,
+            duration=dur,
+        )
+        steps.append({"stage": "perceive_image", "text": inventory})
+        if rescan:
+            steps.append({"stage": rescan, "text": inventory})
+    elif mode == "r2va":
+        labels = []
+        for i, p in enumerate(images, 1):
+            labels.append(f"<Picture {i}> = {p}")
+        for i, p in enumerate(videos, 1):
+            labels.append(f"<Video {i}> = {p}")
+        for i, p in enumerate(audios, 1):
+            labels.append(f"<Audio {i}> = {p}")
+        system = load_prompt("perceive_refs")
+        text = _append_grid_scan(
+            "Inventory attached assets in this order:\n" + "\n".join(labels)
+        )
+        inventory = chat(
+            system,
+            user_parts(
+                text,
+                images=images or None,
+                videos=videos or None,
+                audios=audios or None,
+            ),
+            stage="perceive",
+        )
+        steps.append({"stage": "perceive_refs", "text": inventory})
+        rescanned, rescan = _rescan_if_grid_incomplete(
+            system,
+            inventory,
+            text=text,
+            images=images or None,
+            videos=videos or None,
+            audios=audios or None,
+        )
+        if rescan:
+            inventory = rescanned
+            steps.append({"stage": rescan, "text": inventory})
+
+    # Intent Contract：感知后、路由前；以 01_parse_intent (LLM) 为唯一主真理源，只抽取不推断。
+    contract = parse_intent(intent, mode=mode, inventory=inventory, chat=chat, use_llm=True)
+    steps.append({"stage": "contract", "text": contract.format_for_prompt()})
+    # 时长只有一个真值：显式 API 参数优先，并同步回 Intent Contract。
+    # 否则 contract 中默认的 5 秒会继续进入 expand / format，覆盖调用方传入的时长。
+    if duration is not None:
+        contract.duration_sec = float(dur)
+    elif contract.duration_sec:
+        dur = int(contract.duration_sec)
+
+    router_mode = (skill_router or "hybrid").strip().lower()
+    if router_mode not in ROUTER_MODES:
+        raise ValueError(f"skill_router 须为 {' / '.join(ROUTER_MODES)}")
+
+    mech_router_mode = (mechanism_router or "hybrid").strip().lower()
+    if mech_router_mode not in MECHANISM_ROUTER_MODES:
+        raise ValueError(f"mechanism_router 须为 {' / '.join(MECHANISM_ROUTER_MODES)}")
+
+    # 并发执行风格路由与机制路由（减少串行 LLM 往返延迟）
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as router_pool:
+        f_style = router_pool.submit(
+            select_style_skills,
+            intent,
+            inventory=inventory,
+            forced=skills,
+            router=router_mode,
+            classify=chat if router_mode in {"hybrid", "llm"} else None,
+            explicit_style=contract.explicit_style,
+            explicit_negatives=list(contract.explicit_negatives or []),
+        )
+        f_mech = router_pool.submit(
+            select_mechanisms,
+            intent,
+            inventory=inventory,
+            forced=mechanisms,
+            router=mech_router_mode,
+            classify=chat if mech_router_mode in {"hybrid", "llm"} else None,
+        )
+        style_sel = f_style.result()
+        mech_sel = f_mech.result()
+
+    style_block = style_block_for_user(style_sel)
+    extra_guides = style_sel.overlay_pairs()
+    if style_sel.ids or style_sel.scores:
+        steps.append(
+            {
+                "stage": "skill_route",
+                "source": style_sel.source,
+                "skills": style_sel.ids,
+                "scores": style_sel.scores,
+                "threshold": style_sel.threshold,
+            }
+        )
+
+    mechanism_block = mechanism_block_for_user(mech_sel)
+    writing_block = writing_blocks_for_user(style_block, mechanism_block)
+    if mech_sel.ids:
+        steps.append(
+            {
+                "stage": "mechanism_route",
+                "text": f"source={mech_sel.source}; mechanisms={', '.join(mech_sel.ids)}",
+            }
+        )
+
+    contract_block = contract.format_for_prompt()
+    complexity_block = format_complexity_budget_block(contract)
+
+    # 先扩展意图骨架，再用独立 elaborate 阶段补足可执行的物理、镜头与声画细节。
+    expand_sys = load_prompt("expand_intent")
+    expanded = chat(
+        expand_sys,
+        _expand_user(
+            intent,
+            inventory=inventory,
+            mode=mode,
+            writing_block=writing_block,
+            contract_block=contract_block,
+            complexity_block=complexity_block,
+            contract=contract,
+        ),
+        stage="expand",
+    )
+    steps.append({"stage": "expand", "text": expanded})
+    elaborated = chat(
+        load_prompt("elaborate"),
+        _elaborate_user(
+            expanded,
+            inventory,
+            intent,
+            contract_block=contract_block,
+            complexity_block=complexity_block,
+            contract=contract,
+        ),
+        stage="elaborate",
+    )
+    steps.append({"stage": "elaborate", "text": elaborated})
+
+    format_sys = compose_format_system(mode, load_prompt("format_h3"), extra_guides)
+    format_text = _format_user(
+        mode,
+        elaborated,
+        inventory=inventory,
+        duration=dur,
+        intent=intent,
+        contra
