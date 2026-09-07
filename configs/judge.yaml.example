@@ -1,0 +1,15 @@
+# 本地独立裁判模型（OpenAI 兼容 /v1/chat/completions）
+# 复制为 judge.yaml 后按本机部署修改；可用环境变量覆盖：
+#   JUDGE_BASE_URL / JUDGE_API_KEY / JUDGE_MODEL / JUDGE_TIMEOUT_SEC
+
+base_url: http://127.0.0.1:8091
+api_key: "EMPTY"
+# 本机 served-model-name；若部署的是 Qwen3.8 系列，改成实际名称
+model: qwen3.8
+timeout_sec: 300
+max_retries: 2
+max_tokens: 4096
+temperature: 0.1
+# vLLM / SGLang 上关闭 thinking（若服务不认该字段可删）
+chat_template_kwargs:
+  enable_thinking: false
