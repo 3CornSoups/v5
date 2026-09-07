@@ -1,1 +1,1 @@
-PLACEHOLDER_WILL_REPLACE
+@file:/tmp/gh_push_payloads/pipeline.py.txt
