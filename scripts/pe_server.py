@@ -74,6 +74,10 @@ def execute_pe(payload: dict[str, Any], *, out_root: Path, log_root: Path) -> di
     if mechanism_router not in ROUTER_MODES:
         raise ValueError("mechanism_router 须为 off / keyword / hybrid / llm")
 
+    backend = str(payload.get("backend") or os.environ.get("PE_BACKEND") or "gemini").strip().lower()
+    if backend not in {"gemini", "omni_lora"}:
+        raise ValueError("backend 须为 gemini / omni_lora")
+
     run_id = f"pe_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
     out_dir = Path(out_root) / run_id
     log_dir = Path(log_root) / run_id
@@ -96,19 +100,28 @@ def execute_pe(payload: dict[str, Any], *, out_root: Path, log_root: Path) -> di
             mechanism_router=mechanism_router,
             enable_verify=enable_verify,
             verify_intent_llm=verify_intent_llm,
+            backend=backend,
+            resolution=_optional_string(payload.get("resolution"), "resolution"),
         )
         elapsed = time.perf_counter() - started
         api_calls = len(list(log_dir.glob("*_request.txt")))
+        if rec.get("timing", {}).get("http_calls") is not None:
+            api_calls = int(rec["timing"]["http_calls"])
         result = {
             "request_id": run_id,
             "mode": mode,
+            "backend": rec.get("backend") or backend,
             "profile": profile,
             "intent": intent,
             "duration": rec.get("duration"),
             "prompt": rec.get("prompt") or "",
             "contract": rec.get("contract") or {},
             "verify": rec.get("verify") or {},
-            "metrics": {"elapsed_sec": round(elapsed, 3), "api_calls": api_calls},
+            "metrics": {
+                "elapsed_sec": round(elapsed, 3),
+                "api_calls": api_calls,
+                "omni_lora": rec.get("omni_lora"),
+            },
             "artifacts": {"out_dir": str(out_dir), "log_dir": str(log_dir)},
         }
         if payload.get("include_intermediates") is True:

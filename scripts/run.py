@@ -65,6 +65,12 @@ def main() -> int:
         default=None,
         help="开启 LLM 意图一致性检查（对比原始意图与最终提示词，+1 次调用）",
     )
+    p.add_argument(
+        "--backend",
+        default=None,
+        choices=("gemini", "omni_lora"),
+        help="PE 后端：gemini=原多轮；omni_lora=本地 Qwen2.5-Omni+LoRA 单次改写",
+    )
     args = p.parse_args()
 
     intent = args.intent.strip()
@@ -94,7 +100,11 @@ def main() -> int:
         mechanism_router=args.mechanism_router,
         enable_verify=not args.no_verify,
         verify_intent_llm=args.verify_intent_llm,
+        backend=args.backend,
     )
+    print(f"[{rec['mode']}] backend → {rec.get('backend') or 'gemini'}")
+    if rec.get("timing"):
+        print(f"[{rec['mode']}] timing → {rec['timing']}")
     print(f"[{rec['mode']}] prompt → {Path(rec['out_dir']) / 'prompt.txt'}")
     if rec.get("style_skills"):
         print(f"[{rec['mode']}] skills → {', '.join(rec['style_skills'])} ({rec.get('style_skill_source')})")
