@@ -327,3 +327,176 @@ def _enhance_omni_lora(
     if mech_router_mode not in MECHANISM_ROUTER_MODES:
         raise ValueError(f"mechanism_router 须为 {' / '.join(MECHANISM_ROUTER_MODES)}")
 
+    style_sel = select_style_skills(
+        intent,
+        inventory=None,
+        forced=skills,
+        router="keyword" if router_mode in {"hybrid", "llm"} else router_mode,
+        classify=None,
+    )
+    mech_sel = select_mechanisms(
+        intent,
+        inventory=None,
+        forced=mechanisms,
+        router="keyword" if mech_router_mode in {"hybrid", "llm"} else mech_router_mode,
+        classify=None,
+    )
+    steps.append(
+        {
+            "stage": "skill_route",
+            "source": f"omni_lora+{style_sel.source}",
+            "skills": style_sel.ids,
+            "scores": style_sel.scores,
+            "threshold": style_sel.threshold,
+            "note": "omni_lora 快路径下 hybrid 降为 keyword，避免额外 LLM 往返",
+        }
+    )
+    if mech_sel.ids:
+        steps.append(
+            {
+                "stage": "mechanism_route",
+                "text": f"source=omni_lora+{mech_sel.source}; mechanisms={', '.join(mech_sel.ids)}",
+            }
+        )
+
+    omni = omni_lora_rewrite(
+        mode=mode,
+        intent=intent,
+        duration=duration,
+        first_frame=first_frame,
+        last_frame=last_frame,
+        reference_images=images or None,
+        reference_videos=videos or None,
+        reference_audios=audios or None,
+        resolution=resolution,
+    )
+    prompt = (omni.get("enhanced_prompt") or "").strip()
+    if not prompt:
+        raise RuntimeError("Omni LoRA 返回空 enhanced_prompt")
+    prompt = ensure_alignment_prefix(mode, strip_canvas(prompt), duration)
+    steps.append(
+        {
+            "stage": "omni_lora_rewrite",
+            "task": omni.get("task"),
+            "schema_ok": omni.get("schema_ok"),
+            "server_latency_sec": omni.get("latency_sec"),
+            "client_latency_sec": omni.get("client_latency_sec"),
+            "text": prompt,
+        }
+    )
+
+    total_sec = round(time.perf_counter() - t0, 3)
+    record: dict[str, Any] = {
+        "mode": mode,
+        "backend": "omni_lora",
+        "intent": intent,
+        "duration": duration,
+        "first_frame": first_frame,
+        "last_frame": last_frame,
+        "reference_images": images if mode == "r2va" else [],
+        "i2va_first_frame": first_frame if mode == "i2va" else None,
+        "reference_videos": videos,
+        "reference_audios": audios,
+        "inventory": None,
+        "contract": None,
+        "expanded": None,
+        "elaborated": None,
+        "style_skills": style_sel.ids,
+        "style_skill_source": f"omni_lora+{style_sel.source}",
+        "style_skill_scores": style_sel.scores,
+        "style_skill_threshold": style_sel.threshold,
+        "mechanisms": mech_sel.ids,
+        "mechanism_source": f"omni_lora+{mech_sel.source}",
+        "prompt_official": prompt,
+        "prompt": prompt,
+        "verify": {
+            "status": "skipped",
+            "fixed": False,
+            "issues": [],
+            "schema_ok": bool(omni.get("schema_ok")),
+        },
+        "omni_lora": {
+            "schema_ok": omni.get("schema_ok"),
+            "latency_sec": omni.get("latency_sec"),
+            "client_latency_sec": omni.get("client_latency_sec"),
+            "endpoint": omni.get("endpoint"),
+            "effective_duration": omni.get("effective_duration"),
+            "references": omni.get("references"),
+        },
+        "timing": {"total_sec": total_sec, "http_calls": 1},
+        "steps": steps,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if out_dir is not None:
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "prompt.txt").write_text(prompt + "\n", encoding="utf-8")
+        (out_dir / "run.json").write_text(
+            json.dumps(record, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        record["out_dir"] = str(out_dir)
+    return record
+
+
+def enhance(
+    mode: str,
+    intent: str,
+    *,
+    first_frame: str | None = None,
+    last_frame: str | None = None,
+    reference_images: list[str] | None = None,
+    reference_videos: list[str] | None = None,
+    reference_audios: list[str] | None = None,
+    duration: int | None = None,
+    out_dir: Path | None = None,
+    skills: list[str] | None = None,
+    skill_router: str = "hybrid",
+    mechanisms: list[str] | None = None,
+    mechanism_router: str = "hybrid",
+    enable_verify: bool = True,
+    verify_intent_llm: bool | None = None,
+    backend: str | None = None,
+    resolution: str | None = None,
+) -> dict[str, Any]:
+    """
+    跑完感知（若需要）→ 风格/机制路由 → 扩写 → 补细节 → 注入官方指南后格式化。
+
+    skills: 强制加载的风格 skill id。
+    skill_router: off / keyword / hybrid / llm。
+    hybrid / llm：前置模型为各 skill 打 0~1 分，仅加载 >= match_threshold（默认 0.8）；
+    keyword：仍可只用触发词；off：只用强制 id。
+    mechanisms: 强制加载的 T8 Creative DNA 机制 id。
+    mechanism_router: 机制路由模式，默认同 skill_router（机制侧仍为关键词优先 hybrid）。
+    backend: gemini（默认多轮）| omni_lora（本地 Omni+LoRA 单次改写）。
+
+    Returns:
+        含 prompt、各步原文、mode
+    """
+    mode = mode.lower().strip()
+    if mode not in ALL_MODES:
+        raise ValueError(f"mode 须为 {' / '.join(ALL_MODES)}")
+    intent = (intent or "").strip()
+    if not intent:
+        raise ValueError("短意图为空")
+
+    images = list(reference_images or [])
+    videos = list(reference_videos or [])
+    audios = list(reference_audios or [])
+    if mode == "i2va" and not first_frame:
+        raise ValueError("i2va 需要 --first-frame")
+    if mode == "fl2va" and (not first_frame or not last_frame):
+        raise ValueError("fl2va 需要同时提供 --first-frame 与 --last-frame")
+    if mode == "l2va" and not last_frame:
+        raise ValueError("l2va 需要 --last-frame")
+    if mode == "r2va":
+        if not images and not videos:
+            raise ValueError("r2va 须至少 1 张参考图或 1 段参考视频")
+        if len(images) > 9:
+            raise ValueError("r2va 参考图数量 ≤ 9")
+        if len(videos) > 3:
+            raise ValueError("r2va 参考视频数量 ≤ 3")
+        if len(audios) > 3:
+            raise ValueError("r2va 参考音频数量 ≤ 3")
+
+    pe_backend = _resolve_pe_backend(b
