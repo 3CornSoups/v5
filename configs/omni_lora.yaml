@@ -1,0 +1,5 @@
+# 本地 Qwen2.5-Omni-7B + MiniMax-H3 Prompt Rewriter LoRA
+base_url: "http://127.0.0.1:8910"
+timeout_sec: 600
+default_resolution: "16:9"
+served_model_name: "qwen2.5-omni-7b-h3-lora"
