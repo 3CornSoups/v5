@@ -1,1 +1,1 @@
-PLACEHOLDER_LOAD_FROM_FILE
+file:///tmp/gh_push_payloads/pipeline.py.txt
