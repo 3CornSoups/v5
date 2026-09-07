@@ -1,4 +1,7 @@
 # 本地 Qwen2.5-Omni-7B + MiniMax-H3 Prompt Rewriter LoRA
+# 权重不在本仓库；见 docs/OMNI_LORA_BACKEND.md「服务器路径」
+# 基座: /kwkj-k8s/zwb/0903qwen-ir/Qwen2.5-Omni-7B
+# LoRA: /kwkj-k8s/zwb/0903qwen-ir/MiniMax-H3-Prompt-Rewriter-LoRA-Omni
 base_url: "http://127.0.0.1:8910"
 timeout_sec: 600
 default_resolution: "16:9"
